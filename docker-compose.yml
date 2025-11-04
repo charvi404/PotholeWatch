@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  # MongoDB
+  mongo:
+    image: mongo:6
+    container_name: pothole_mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - pothole_network
+
+  # LocalStack for AWS services mock (optional for local dev)
+  localstack:
+    image: localstack/localstack:latest
+    container_name: pothole_localstack
+    ports:
+      - "4566:4566"  # LocalStack edge port
+    environment:
+      - SERVICES=s3,sns,dynamodb
+      - DEBUG=1
+      - DATA_DIR=/tmp/localstack/data
+    volumes:
+      - localstack_data:/tmp/localstack
+    networks:
+      - pothole_network
+
+  # Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pothole_backend
+    ports:
+      - "8001:8001"
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - DB_NAME=pothole_detection
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=ap-south-1
+      - S3_BUCKET=pothole-images-bucket
+      - USE_SNS=false
+      - MOCK_SMS=true
+      - USE_LOCAL_STORAGE=true
+      - PHONE_AUTHORITY=+918010303436
+    volumes:
+      - ./backend:/app
+      - ./backend/uploads:/app/uploads
+    depends_on:
+      - mongo
+      - localstack
+    networks:
+      - pothole_network
+    command: uvicorn server:app --host 0.0.0.0 --port 8001 --reload
+
+  # Frontend (optional - can run with npm start locally)
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: pothole_frontend
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - REACT_APP_BACKEND_URL=http://localhost:8001
+  #   volumes:
+  #     - ./frontend:/app
+  #     - /app/node_modules
+  #   networks:
+  #     - pothole_network
+
+volumes:
+  mongo_data:
+  localstack_data:
+
+networks:
+  pothole_network:
+    driver: bridge
