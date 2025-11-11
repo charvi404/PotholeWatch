@@ -1,25 +1,19 @@
-from fastapi import FastAPI, APIRouter, File, UploadFile, Form, HTTPException, Depends, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, APIRouter, File, UploadFile, Form, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from sklearn.cluster import DBSCAN
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr
 from typing import List, Optional, Dict, Any
 import uuid
 from datetime import datetime, timezone, timedelta
 from passlib.context import CryptContext
-import jwt
 import boto3
 from botocore.config import Config
-from ultralytics import YOLO
 import cv2
 import numpy as np
-from PIL import Image
-import io
 import json
 
 # Load environment variables
@@ -27,11 +21,6 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # Constants
-JWT_SECRET = os.environ.get('JWT_SECRET', 'your-secret-key-change-in-production')
-JWT_ALGORITHM = 'HS256'
-JWT_EXPIRATION_HOURS = 24
-
-# AWS Configuration
 AWS_REGION = os.environ.get('AWS_REGION', 'ap-south-1')
 S3_BUCKET = os.environ.get('S3_BUCKET', 'pothole-images-bucket')
 USE_SNS = os.environ.get('USE_SNS', 'false').lower() == 'true'
@@ -60,9 +49,6 @@ db = client[os.environ['DB_NAME']]
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Security
-security = HTTPBearer()
-
 # Create FastAPI app
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -70,21 +56,6 @@ api_router = APIRouter(prefix="/api")
 # Ensure uploads directory exists
 UPLOADS_DIR = ROOT_DIR / 'uploads'
 UPLOADS_DIR.mkdir(exist_ok=True)
-
-# Load YOLO model at startup
-MODEL_PATH = ROOT_DIR / 'best.pt'
-model = None
-
-def load_model():
-    global model
-    try:
-        if MODEL_PATH.exists():
-            model = YOLO(str(MODEL_PATH))
-            logger.info("YOLO model loaded successfully")
-        else:
-            logger.warning(f"Model file not found at {MODEL_PATH}")
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
 
 # Pricing table
 MATERIAL_PRICING = {
@@ -155,31 +126,6 @@ class Notification(BaseModel):
     created_at: str
 
 # Helper Functions
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-def create_access_token(user_id: str, email: str, role: str) -> str:
-    payload = {
-        'user_id': user_id,
-        'email': email,
-        'role': role,
-        'exp': datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
-    try:
-        token = credentials.credentials
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
 def calculate_severity(total_area_m2: float) -> str:
     """Determine severity based on total pothole area"""
     if total_area_m2 < 0.2:
@@ -266,149 +212,83 @@ async def send_sms(phone_number: str, message: str) -> dict:
 
 def process_detections(image_path: str, distance_factor: float = 1.0) -> dict:
     """
-    Run inference using Roboflow (if enabled) or YOLOv8 (local model),
-    aggregate all potholes, compute total area, count, and confidence.
+    Run inference using Roboflow (only), aggregate all potholes, compute total area, count, and confidence.
     Applies a distance factor to adjust perceived area scaling.
     """
-    use_roboflow = os.environ.get("USE_ROBOFLOW", "false").lower() == "true"
+    use_roboflow = True  # Always use Roboflow
+    from inference_sdk import InferenceHTTPClient
 
-    # ✅ ROB0FLOW INFERENCE
-    if use_roboflow:
-        from inference_sdk import InferenceHTTPClient
+    rf_api_key = os.environ.get("ROBOFLOW_API_KEY")
+    rf_model_id = os.environ.get("ROBOFLOW_MODEL_ID")
 
-        rf_api_key = os.environ.get("ROBOFLOW_API_KEY")
-        rf_model_id = os.environ.get("ROBOFLOW_MODEL_ID")
+    client = InferenceHTTPClient(
+        api_url="https://serverless.roboflow.com",
+        api_key=rf_api_key
+    )
 
-        client = InferenceHTTPClient(
-            api_url="https://serverless.roboflow.com",
-            api_key=rf_api_key
-        )
+    try:
+        result = client.infer(image_path, model_id=rf_model_id)
+        predictions = result.get("predictions", [])
 
-        try:
-            result = client.infer(image_path, model_id=rf_model_id)
-            predictions = result.get("predictions", [])
-
-            if not predictions:
-                return {
-                    "pothole_count": 0,
-                    "total_area_m2": 0.0,
-                    "confidence": 0.0,
-                    "detections": []
-                }
-
-            img = cv2.imread(image_path)
-            h, w = img.shape[:2]
-
-            # Base assumption: lane width ≈ 3.5 m
-            LANE_WIDTH_M = 3.5
-            meters_per_pixel = (LANE_WIDTH_M / w) * distance_factor
-
-            detections = []
-            total_area_m2 = 0.0
-            confidence_sum = 0.0
-
-            for det in predictions:
-                x, y, box_w, box_h = det["x"], det["y"], det["width"], det["height"]
-                conf = float(det["confidence"])
-
-                # Convert bbox corners
-                x1, y1 = int(x - box_w / 2), int(y - box_h / 2)
-                x2, y2 = int(x + box_w / 2), int(y + box_h / 2)
-
-                # Convert area from pixels to meters²
-                area_m2 = (box_w * meters_per_pixel) * (box_h * meters_per_pixel)
-
-                detections.append({
-                    "bbox": [x1, y1, x2, y2],
-                    "confidence": round(conf * 100, 2),
-                    "area_m2": round(area_m2, 4)
-                })
-
-                total_area_m2 += area_m2
-                confidence_sum += conf
-
-                # Draw detection
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(img, f"{conf:.2f}", (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-            processed_path = Path(image_path).parent / f"processed_{Path(image_path).name}"
-            cv2.imwrite(str(processed_path), img)
-
-            avg_conf = confidence_sum / len(detections)
-
+        if not predictions:
             return {
-                "pothole_count": len(detections),
-                "total_area_m2": round(total_area_m2, 3),
-                "confidence": round(avg_conf * 100, 1),
-                "detections": detections,
-                "processed_image_path": str(processed_path)
+                "pothole_count": 0,
+                "total_area_m2": 0.0,
+                "confidence": 0.0,
+                "detections": []
             }
 
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Roboflow error: {str(e)}")
+        img = cv2.imread(image_path)
+        h, w = img.shape[:2]
 
-    # ✅ LOCAL YOLO FALLBACK
-    if model is None:
-        raise HTTPException(status_code=500, detail="Model not loaded")
+        # Base assumption: lane width ≈ 3.5 m
+        LANE_WIDTH_M = 3.5
+        meters_per_pixel = (LANE_WIDTH_M / w) * distance_factor
 
-    results = model.predict(source=image_path, conf=0.25)
-    result = results[0]
+        detections = []
+        total_area_m2 = 0.0
+        confidence_sum = 0.0
 
-    if len(result.boxes) == 0:
+        for det in predictions:
+            x, y, box_w, box_h = det["x"], det["y"], det["width"], det["height"]
+            conf = float(det["confidence"])
+
+            # Convert bbox corners
+            x1, y1 = int(x - box_w / 2), int(y - box_h / 2)
+            x2, y2 = int(x + box_w / 2), int(y + box_h / 2)
+
+            # Convert area from pixels to meters²
+            area_m2 = (box_w * meters_per_pixel) * (box_h * meters_per_pixel)
+
+            detections.append({
+                "bbox": [x1, y1, x2, y2],
+                "confidence": round(conf * 100, 2),
+                "area_m2": round(area_m2, 4)
+            })
+
+            total_area_m2 += area_m2
+            confidence_sum += conf
+
+            # Draw detection
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(img, f"{conf:.2f}", (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        processed_path = Path(image_path).parent / f"processed_{Path(image_path).name}"
+        cv2.imwrite(str(processed_path), img)
+
+        avg_conf = confidence_sum / len(detections)
+
         return {
-            "pothole_count": 0,
-            "total_area_m2": 0.0,
-            "confidence": 0.0,
-            "detections": []
+            "pothole_count": len(detections),
+            "total_area_m2": round(total_area_m2, 3),
+            "confidence": round(avg_conf * 100, 1),
+            "detections": detections,
+            "processed_image_path": str(processed_path)
         }
 
-    img = cv2.imread(image_path)
-    h, w = img.shape[:2]
-
-    LANE_WIDTH_M = 3.5
-    meters_per_pixel_x = (LANE_WIDTH_M / w) * distance_factor
-    meters_per_pixel_y = meters_per_pixel_x
-
-    detections = []
-    total_area_m2 = 0.0
-    conf_sum = 0.0
-
-    for box in result.boxes:
-        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-        conf = float(box.conf[0].cpu().numpy())
-        width_px = x2 - x1
-        height_px = y2 - y1
-
-        # Apply distance adjustment
-        area_m2 = (width_px * meters_per_pixel_x) * (height_px * meters_per_pixel_y)
-
-        detections.append({
-            "bbox": [float(x1), float(y1), float(x2), float(y2)],
-            "confidence": round(conf * 100, 2),
-            "area_m2": round(area_m2, 4)
-        })
-
-        total_area_m2 += area_m2
-        conf_sum += conf
-
-        # Draw box + confidence label
-        cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-        cv2.putText(img, f"{conf:.2f}", (int(x1), int(y1) - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-    processed_path = Path(image_path).parent / f"processed_{Path(image_path).name}"
-    cv2.imwrite(str(processed_path), img)
-
-    avg_conf = conf_sum / len(detections)
-
-    return {
-        "pothole_count": len(detections),
-        "total_area_m2": round(total_area_m2, 3),
-        "confidence": round(avg_conf * 100, 1),
-        "detections": detections,
-        "processed_image_path": str(processed_path)
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Roboflow error: {str(e)}")
 
 
 # API Endpoints
@@ -416,57 +296,40 @@ def process_detections(image_path: str, distance_factor: float = 1.0) -> dict:
 async def root():
     return {"message": "Pothole Detection API", "status": "operational"}
 
+# Signup endpoint (no JWT)
 @api_router.post("/auth/signup")
 async def signup(user_data: UserCreate):
     # Check if user exists
     existing_user = await db.users.find_one({'email': user_data.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
-    
-    # Create user
-    user_id = str(uuid.uuid4())
-    hashed_pwd = hash_password(user_data.password)
-    
+    # Hash password
+    hashed_pwd = pwd_context.hash(user_data.password)
     user_doc = {
-        'id': user_id,
+        'id': str(uuid.uuid4()),
         'name': user_data.name,
         'email': user_data.email,
         'password': hashed_pwd,
         'role': user_data.role,
         'created_at': datetime.now(timezone.utc).isoformat()
     }
-    
     await db.users.insert_one(user_doc)
-    
-    # Generate token
-    token = create_access_token(user_id, user_data.email, user_data.role)
-    
-    return {
-        'user': {
-            'id': user_id,
-            'name': user_data.name,
-            'email': user_data.email,
-            'role': user_data.role
-        },
-        'token': token
-    }
+    return {"message": "User registered successfully"}
 
+# Login endpoint (no JWT)
 @api_router.post("/auth/login")
 async def login(credentials: UserLogin):
     user = await db.users.find_one({'email': credentials.email})
-    if not user or not verify_password(credentials.password, user['password']):
+    if not user or not pwd_context.verify(credentials.password, user['password']):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    
-    token = create_access_token(user['id'], user['email'], user['role'])
-    
     return {
-        'user': {
-            'id': user['id'],
-            'name': user['name'],
-            'email': user['email'],
-            'role': user['role']
-        },
-        'token': token
+        "message": "Login successful",
+        "user": {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+            "role": user["role"]
+        }
     }
 
 @api_router.post("/potholes/analyze")
@@ -474,8 +337,7 @@ async def analyze_pothole(
     image: UploadFile = File(...),
     location: str = Form(...),
     coordinates: str = Form(...),
-    distance_factor: float = Form(1.0),
-    current_user: dict = Depends(get_current_user)
+    distance_factor: float = Form(1.0)
 ):
     try:
         # Parse coordinates
@@ -491,7 +353,7 @@ async def analyze_pothole(
             content = await image.read()
             f.write(content)
         
-        # Process with YOLO
+        # Process with Roboflow
         detection_result = process_detections(str(file_path), distance_factor)
         
         # Calculate severity and cost
@@ -513,7 +375,7 @@ async def analyze_pothole(
         pothole_id = str(uuid.uuid4())
         pothole_doc = {
             'id': pothole_id,
-            'user_id': current_user['user_id'],
+            'user_id': None,
             'image_url': image_url,
             's3_url': image_url if not LOCAL_STORAGE else None,
             'processed_image_url': processed_image_url,
@@ -529,8 +391,8 @@ async def analyze_pothole(
             'status': 'Pending',
             'audit': [{
                 'action': 'uploaded',
-                'actor_id': current_user['user_id'],
-                'actor_role': current_user['role'],
+                'actor_id': None,
+                'actor_role': None,
                 'timestamp': datetime.now(timezone.utc).isoformat()
             }],
             'created_at': datetime.now(timezone.utc).isoformat(),
@@ -584,14 +446,14 @@ async def get_potholes(
     return potholes
 
 @api_router.get("/potholes/{pothole_id}")
-async def get_pothole(pothole_id: str, current_user: dict = Depends(get_current_user)):
+async def get_pothole(pothole_id: str):
     pothole = await db.potholes.find_one({'id': pothole_id}, {'_id': 0})
     if not pothole:
         raise HTTPException(status_code=404, detail="Pothole not found")
     return pothole
 
 @api_router.post("/potholes/{pothole_id}/notify")
-async def notify_authorities(pothole_id: str, current_user: dict = Depends(get_current_user)):
+async def notify_authorities(pothole_id: str):
     pothole = await db.potholes.find_one({'id': pothole_id})
     if not pothole:
         raise HTTPException(status_code=404, detail="Pothole not found")
@@ -603,8 +465,8 @@ async def notify_authorities(pothole_id: str, current_user: dict = Depends(get_c
     # Update status and audit
     audit_entry = {
         'action': 'reported_to_authority',
-        'actor_id': current_user['user_id'],
-        'actor_role': current_user['role'],
+        'actor_id': None,
+        'actor_role': None,
         'timestamp': datetime.now(timezone.utc).isoformat()
     }
     
@@ -628,13 +490,8 @@ async def notify_authorities(pothole_id: str, current_user: dict = Depends(get_c
 @api_router.post("/potholes/{pothole_id}/action")
 async def pothole_action(
     pothole_id: str,
-    action_data: PotholeAction,
-    current_user: dict = Depends(get_current_user)
+    action_data: PotholeAction
 ):
-    # Check authority role
-    if current_user['role'] != 'authority':
-        raise HTTPException(status_code=403, detail="Only authorities can perform actions")
-    
     pothole = await db.potholes.find_one({'id': pothole_id})
     if not pothole:
         raise HTTPException(status_code=404, detail="Pothole not found")
@@ -653,8 +510,8 @@ async def pothole_action(
     # Create audit entry
     audit_entry = {
         'action': action_data.action,
-        'actor_id': current_user['user_id'],
-        'actor_role': current_user['role'],
+        'actor_id': None,
+        'actor_role': None,
         'notes': action_data.notes,
         'timestamp': datetime.now(timezone.utc).isoformat()
     }
@@ -667,13 +524,6 @@ async def pothole_action(
             '$push': {'audit': audit_entry}
         }
     )
-    
-    # Send SMS if notify_citizen action
-    if action_data.action == 'notify_citizen':
-        user = await db.users.find_one({'id': pothole['user_id']})
-        if user:
-            message = f"Update on your pothole report at {pothole['location']}: {action_data.notes or 'Status updated to ' + new_status}"
-            await send_sms(user.get('phone', PHONE_AUTHORITY), message)
     
     return {'message': 'Action recorded', 'new_status': new_status}
 
@@ -697,19 +547,12 @@ async def assign_drone(pothole_id: str):
     return updated_pothole
 
 @api_router.get("/users/{user_id}/reports")
-async def get_user_reports(user_id: str, current_user: dict = Depends(get_current_user)):
-    # Users can only see their own reports unless they're authority
-    if current_user['user_id'] != user_id and current_user['role'] != 'authority':
-        raise HTTPException(status_code=403, detail="Access denied")
-    
+async def get_user_reports(user_id: str):
     reports = await db.potholes.find({'user_id': user_id}, {'_id': 0}).sort('created_at', -1).to_list(1000)
     return reports
 
 @api_router.get("/notifications")
-async def get_notifications(current_user: dict = Depends(get_current_user)):
-    if current_user['role'] != 'authority':
-        raise HTTPException(status_code=403, detail="Only authorities can view notifications")
-    
+async def get_notifications():
     notifications = await db.notifications.find({}, {'_id': 0}).sort('created_at', -1).to_list(100)
     return notifications
 
@@ -735,7 +578,6 @@ logger = logging.getLogger(__name__)
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    load_model()
     logger.info("Application started")
 
 @app.on_event("shutdown")
