@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pothole Detection Tester</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f6f8;
+      padding: 40px;
+      text-align: center;
+    }
+    h1 { color: #1f2937; }
+    form {
+      background: white;
+      border-radius: 10px;
+      padding: 20px;
+      display: inline-block;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    input, button {
+      margin: 8px;
+      padding: 10px;
+      border-radius: 5px;
+      border: 1px solid #ccc;
+      width: 90%;
+      max-width: 300px;
+    }
+    button {
+      background-color: #2563eb;
+      color: white;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    button:hover {
+      background-color: #1d4ed8;
+    }
+    img {
+      margin-top: 20px;
+      max-width: 90%;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    .result {
+      margin-top: 20px;
+      text-align: left;
+      background: white;
+      padding: 20px;
+      border-radius: 10px;
+      display: inline-block;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+      width: 90%;
+      max-width: 600px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🚗 Smart Pothole Detection (Local Test)</h1>
+  <p>Upload a pothole image to test your YOLOv8 model (`best.pt`)</p>
+
+  <form id="uploadForm" onsubmit="return false;">
+    <input type="file" id="imageInput" accept="image/*" required><br>
+    <input type="text" id="location" placeholder="Enter location" required><br>
+    <input type="text" id="lat" placeholder="Latitude (optional)">
+    <input type="text" id="lng" placeholder="Longitude (optional)"><br>
+    <button type="button" id="analyzeBtn">Analyze</button>
+  </form>
+
+  <div id="result" class="result"></div>
+
+  <script>
+    const API_URL = "http://127.0.0.1:8000/api/potholes/analyze";
+    const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoiNTQwMjhjZmYtYzA5ZC00ZWIxLWIwODMtOGNjMDRmOWMyY2EzIiwiZW1haWwiOiJjaGFydmlAZ21haWwuY29tIiwicm9sZSI6ImNpdGl6ZW4iLCJleHAiOjE3NjI5MjU5NzZ9.cny39Cl9BNOQF2MJlYXrjOP0fxs-TqUIoCUSXnB3Va8"; // Get this from /api/auth/login
+
+    document.getElementById("analyzeBtn").addEventListener("click", async () => {
+      const imageFile = document.getElementById("imageInput").files[0];
+      const location = document.getElementById("location").value;
+      const lat = document.getElementById("lat").value;
+      const lng = document.getElementById("lng").value;
+      const resultDiv = document.getElementById("result");
+
+      if (!imageFile || !location.trim()) {
+        alert("Please select an image and enter a location.");
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("image", imageFile);
+      formData.append("location", location);
+      formData.append("coordinates", JSON.stringify({ lat: lat || 0, lng: lng || 0 }));
+
+      resultDiv.innerHTML = "<p>⏳ Analyzing image...</p>";
+
+      try {
+        const response = await fetch(API_URL, {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${TOKEN}` },
+          body: formData
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.detail || "Error during analysis");
+        }
+
+        resultDiv.innerHTML = `
+          <h3>✅ Detection Result</h3>
+          <p><b>Severity:</b> ${data.severity}</p>
+          <p><b>Total Area:</b> ${data.total_area_m2} m²</p>
+          <p><b>Confidence:</b> ${data.confidence}%</p>
+          <p><b>Cost:</b> ₹${data.estimated_cost_inr}</p>
+          <p><b>Material:</b> ${data.material}</p>
+          <p><b>Potholes Detected:</b> ${data.pothole_count}</p>
+          <h4>Original Image:</h4>
+          <img src="http://127.0.0.1:8000${data.image_url}" alt="Original">
+          <h4>Processed Image (YOLO Output):</h4>
+          <img src="http://127.0.0.1:8000${data.processed_image_url}" alt="Processed">
+        `;
+      } catch (error) {
+        resultDiv.innerHTML = `<p style="color:red;">❌ ${error.message}</p>`;
+      }
+    });
+  </script>
+</body>
+</html>

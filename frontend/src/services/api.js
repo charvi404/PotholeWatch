@@ -29,11 +29,13 @@ const api = {
   },
 
   // Pothole operations
-  analyzePothole: async (file, location, coordinates) => {
+  analyzePothole: async (file, location, coordinates, distanceFactor = 1.0) => {
     const formData = new FormData();
     formData.append('image', file);
     formData.append('location', location);
-    formData.append('coordinates', JSON.stringify(coordinates));
+    formData.append('coordinates', JSON.stringify(coordinates))
+    formData.append('distance_factor', distanceFactor);
+;
 
     const response = await axios.post(`${API}/potholes/analyze`, formData, {
       headers: {
@@ -87,6 +89,15 @@ const api = {
     });
     return response.data;
   },
+assignDrone: async (potholeId) => {
+  const response = await axios.post(
+    `${API}/potholes/${potholeId}/assign-drone`,
+    {},
+    { headers: getAuthHeader() }
+  );
+  return response.data;
+},
+
 
   getNotifications: async () => {
     const response = await axios.get(`${API}/notifications`, {

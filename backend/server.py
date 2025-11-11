@@ -3,6 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from sklearn.cluster import DBSCAN
 import os
 import logging
 from pathlib import Path
@@ -209,124 +210,206 @@ async def upload_to_s3(file_path: Path, key: str) -> str:
         return f"/uploads/{key}"
 
 async def send_sms(phone_number: str, message: str) -> dict:
-    """Send SMS via SNS or log if in mock mode"""
+    """Send SMS via Twilio or fallback to mock logging"""
     notification_id = str(uuid.uuid4())
-    
-    if MOCK_SMS:
-        logger.info(f"[MOCK SMS] To: {phone_number}, Message: {message}")
-        notification = {
-            'id': notification_id,
-            'phone_number': phone_number,
-            'message': message,
-            'status': 'mocked',
-            'created_at': datetime.now(timezone.utc).isoformat()
-        }
-    else:
+
+    use_twilio = os.getenv("USE_TWILIO", "false").lower() == "true"
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    from_number = os.getenv("TWILIO_PHONE_NUMBER")
+
+    if use_twilio:
         try:
-            response = sns_client.publish(
-                PhoneNumber=phone_number,
-                Message=message
+            from twilio.rest import Client
+            client = Client(account_sid, auth_token)
+
+            response = client.messages.create(
+                body=message,
+                from_=from_number,
+                to=phone_number
             )
+
             notification = {
-                'id': notification_id,
-                'phone_number': phone_number,
-                'message': message,
-                'status': 'sent',
-                'message_id': response.get('MessageId'),
-                'created_at': datetime.now(timezone.utc).isoformat()
+                "id": notification_id,
+                "phone_number": phone_number,
+                "message": message,
+                "status": "sent",
+                "message_sid": response.sid,
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
+
+            logger.info(f"✅ SMS sent to {phone_number}: {message}")
+
         except Exception as e:
-            logger.error(f"SMS send error: {e}")
+            logger.error(f"❌ Twilio send error: {e}")
             notification = {
-                'id': notification_id,
-                'phone_number': phone_number,
-                'message': message,
-                'status': 'failed',
-                'error': str(e),
-                'created_at': datetime.now(timezone.utc).isoformat()
+                "id": notification_id,
+                "phone_number": phone_number,
+                "message": message,
+                "status": "failed",
+                "error": str(e),
+                "created_at": datetime.now(timezone.utc).isoformat(),
             }
-    
+    else:
+        logger.info(f"[MOCK SMS] → {phone_number}: {message}")
+        notification = {
+            "id": notification_id,
+            "phone_number": phone_number,
+            "message": message,
+            "status": "mocked",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     await db.notifications.insert_one(notification)
     return notification
 
-def process_detections(image_path: str) -> dict:
-    """Run YOLO inference and calculate aggregated metrics"""
+
+def process_detections(image_path: str, distance_factor: float = 1.0) -> dict:
+    """
+    Run inference using Roboflow (if enabled) or YOLOv8 (local model),
+    aggregate all potholes, compute total area, count, and confidence.
+    Applies a distance factor to adjust perceived area scaling.
+    """
+    use_roboflow = os.environ.get("USE_ROBOFLOW", "false").lower() == "true"
+
+    # ✅ ROB0FLOW INFERENCE
+    if use_roboflow:
+        from inference_sdk import InferenceHTTPClient
+
+        rf_api_key = os.environ.get("ROBOFLOW_API_KEY")
+        rf_model_id = os.environ.get("ROBOFLOW_MODEL_ID")
+
+        client = InferenceHTTPClient(
+            api_url="https://serverless.roboflow.com",
+            api_key=rf_api_key
+        )
+
+        try:
+            result = client.infer(image_path, model_id=rf_model_id)
+            predictions = result.get("predictions", [])
+
+            if not predictions:
+                return {
+                    "pothole_count": 0,
+                    "total_area_m2": 0.0,
+                    "confidence": 0.0,
+                    "detections": []
+                }
+
+            img = cv2.imread(image_path)
+            h, w = img.shape[:2]
+
+            # Base assumption: lane width ≈ 3.5 m
+            LANE_WIDTH_M = 3.5
+            meters_per_pixel = (LANE_WIDTH_M / w) * distance_factor
+
+            detections = []
+            total_area_m2 = 0.0
+            confidence_sum = 0.0
+
+            for det in predictions:
+                x, y, box_w, box_h = det["x"], det["y"], det["width"], det["height"]
+                conf = float(det["confidence"])
+
+                # Convert bbox corners
+                x1, y1 = int(x - box_w / 2), int(y - box_h / 2)
+                x2, y2 = int(x + box_w / 2), int(y + box_h / 2)
+
+                # Convert area from pixels to meters²
+                area_m2 = (box_w * meters_per_pixel) * (box_h * meters_per_pixel)
+
+                detections.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "confidence": round(conf * 100, 2),
+                    "area_m2": round(area_m2, 4)
+                })
+
+                total_area_m2 += area_m2
+                confidence_sum += conf
+
+                # Draw detection
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img, f"{conf:.2f}", (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            processed_path = Path(image_path).parent / f"processed_{Path(image_path).name}"
+            cv2.imwrite(str(processed_path), img)
+
+            avg_conf = confidence_sum / len(detections)
+
+            return {
+                "pothole_count": len(detections),
+                "total_area_m2": round(total_area_m2, 3),
+                "confidence": round(avg_conf * 100, 1),
+                "detections": detections,
+                "processed_image_path": str(processed_path)
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Roboflow error: {str(e)}")
+
+    # ✅ LOCAL YOLO FALLBACK
     if model is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
-    
-    # Run inference
+
     results = model.predict(source=image_path, conf=0.25)
     result = results[0]
-    
+
     if len(result.boxes) == 0:
         return {
-            'pothole_count': 0,
-            'total_area_m2': 0.0,
-            'confidence': 0.0,
-            'detections': []
+            "pothole_count": 0,
+            "total_area_m2": 0.0,
+            "confidence": 0.0,
+            "detections": []
         }
-    
-    # Load image to get dimensions
+
     img = cv2.imread(image_path)
-    img_height, img_width = img.shape[:2]
-    
-    # Heuristic: Assume camera at ~1.5m height capturing ~3.5m wide lane
-    # meters_per_pixel = lane_width_m / image_width_px
+    h, w = img.shape[:2]
+
     LANE_WIDTH_M = 3.5
-    meters_per_pixel_x = LANE_WIDTH_M / img_width
-    meters_per_pixel_y = meters_per_pixel_x  # Assuming square pixels
-    
+    meters_per_pixel_x = (LANE_WIDTH_M / w) * distance_factor
+    meters_per_pixel_y = meters_per_pixel_x
+
     detections = []
-    total_area_px = 0
-    confidence_sum = 0
-    
-    # Process all detections
+    total_area_m2 = 0.0
+    conf_sum = 0.0
+
     for box in result.boxes:
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
         conf = float(box.conf[0].cpu().numpy())
-        
-        # Calculate pixel area
         width_px = x2 - x1
         height_px = y2 - y1
-        area_px = width_px * height_px
-        
-        # Convert to real-world area (m²)
-        width_m = width_px * meters_per_pixel_x
-        height_m = height_px * meters_per_pixel_y
-        area_m2 = width_m * height_m
-        
+
+        # Apply distance adjustment
+        area_m2 = (width_px * meters_per_pixel_x) * (height_px * meters_per_pixel_y)
+
         detections.append({
-            'bbox': [float(x1), float(y1), float(x2), float(y2)],
-            'confidence': conf,
-            'area_px': float(area_px),
-            'area_m2': float(area_m2)
+            "bbox": [float(x1), float(y1), float(x2), float(y2)],
+            "confidence": round(conf * 100, 2),
+            "area_m2": round(area_m2, 4)
         })
-        
-        total_area_px += area_px
-        confidence_sum += conf
-    
-    pothole_count = len(detections)
-    avg_confidence = confidence_sum / pothole_count if pothole_count > 0 else 0
-    total_area_m2 = sum(d['area_m2'] for d in detections)
-    
-    # Draw bounding boxes on image
-    for det in detections:
-        x1, y1, x2, y2 = det['bbox']
+
+        total_area_m2 += area_m2
+        conf_sum += conf
+
+        # Draw box + confidence label
         cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-        cv2.putText(img, f"{det['confidence']:.2f}", (int(x1), int(y1)-5),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    
-    # Save processed image
+        cv2.putText(img, f"{conf:.2f}", (int(x1), int(y1) - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
     processed_path = Path(image_path).parent / f"processed_{Path(image_path).name}"
     cv2.imwrite(str(processed_path), img)
-    
+
+    avg_conf = conf_sum / len(detections)
+
     return {
-        'pothole_count': pothole_count,
-        'total_area_m2': round(total_area_m2, 2),
-        'confidence': round(avg_confidence * 100, 1),
-        'detections': detections,
-        'processed_image_path': str(processed_path)
+        "pothole_count": len(detections),
+        "total_area_m2": round(total_area_m2, 3),
+        "confidence": round(avg_conf * 100, 1),
+        "detections": detections,
+        "processed_image_path": str(processed_path)
     }
+
 
 # API Endpoints
 @api_router.get("/")
@@ -391,6 +474,7 @@ async def analyze_pothole(
     image: UploadFile = File(...),
     location: str = Form(...),
     coordinates: str = Form(...),
+    distance_factor: float = Form(1.0),
     current_user: dict = Depends(get_current_user)
 ):
     try:
@@ -408,7 +492,7 @@ async def analyze_pothole(
             f.write(content)
         
         # Process with YOLO
-        detection_result = process_detections(str(file_path))
+        detection_result = process_detections(str(file_path), distance_factor)
         
         # Calculate severity and cost
         severity = calculate_severity(detection_result['total_area_m2'])
@@ -478,16 +562,25 @@ async def analyze_pothole(
 @api_router.get("/potholes")
 async def get_potholes(
     status: Optional[str] = None,
-    severity: Optional[str] = None,
-    current_user: dict = Depends(get_current_user)
+    severity: Optional[str] = None
 ):
     query = {}
     if status:
         query['status'] = status
     if severity:
         query['severity'] = severity
-    
     potholes = await db.potholes.find(query, {'_id': 0}).sort('created_at', -1).to_list(1000)
+    # Ensure drone_status is present in every pothole
+    for p in potholes:
+        if 'drone_status' not in p:
+            if p.get('status') == 'Pending':
+                p['drone_status'] = 'unassigned'
+            elif p.get('status') == 'In Progress':
+                p['drone_status'] = 'in_progress'
+            elif p.get('status') == 'Resolved':
+                p['drone_status'] = 'completed'
+            else:
+                p['drone_status'] = 'unassigned'
     return potholes
 
 @api_router.get("/potholes/{pothole_id}")
@@ -583,6 +676,25 @@ async def pothole_action(
             await send_sms(user.get('phone', PHONE_AUTHORITY), message)
     
     return {'message': 'Action recorded', 'new_status': new_status}
+
+@api_router.post("/potholes/{pothole_id}/assign-drone")
+async def assign_drone(pothole_id: str):
+    pothole = await db.potholes.find_one({'id': pothole_id})
+    if not pothole:
+        raise HTTPException(status_code=404, detail="Pothole not found")
+
+    # Update status and drone_status
+    update_fields = {
+        'status': 'in_progress',
+        'drone_status': 'in_progress',
+        'updated_at': datetime.now(timezone.utc).isoformat()
+    }
+    await db.potholes.update_one(
+        {'id': pothole_id},
+        {'$set': update_fields}
+    )
+    updated_pothole = await db.potholes.find_one({'id': pothole_id}, {'_id': 0})
+    return updated_pothole
 
 @api_router.get("/users/{user_id}/reports")
 async def get_user_reports(user_id: str, current_user: dict = Depends(get_current_user)):

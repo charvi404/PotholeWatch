@@ -8,6 +8,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { LogOut, Filter, CheckCircle, Send } from 'lucide-react';
 import { toast } from 'sonner';
 import api from '../services/api';
+import { MapContainer, TileLayer, Marker, Popup, CircleMarker } from 'react-leaflet';
 
 const AuthorityDashboard = ({ user, onLogout }) => {
   const [reports, setReports] = useState([]);
@@ -45,6 +46,26 @@ const AuthorityDashboard = ({ user, onLogout }) => {
       filtered = filtered.filter(r => r.status === filterStatus);
     }
     setFilteredReports(filtered);
+  };
+
+  const handleAssignDrone = async (potholeId) => {
+    setLoading(true);
+    try {
+      await api.assignDrone(potholeId);
+      toast.success('Drone assigned successfully');
+      loadReports();
+    } catch (error) {
+      toast.error('Failed to assign drone');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const getMarkerColor = (status) => {
+    if (status === 'Pending') return 'red';
+    if (status === 'In Progress') return 'yellow';
+    if (status === 'Resolved') return 'green';
+    return 'red';
   };
 
   const handleAction = async (potholeId, action) => {
@@ -137,7 +158,72 @@ const AuthorityDashboard = ({ user, onLogout }) => {
             </CardContent>
           </Card>
         </div>
-
+        {/* Pothole Map - move outside the grid, make it full width */}
+        <Card className="mb-8 w-full">
+          <CardHeader>
+            <CardTitle>Pothole Map</CardTitle>
+            <CardDescription>All potholes shown as markers</CardDescription>
+          </CardHeader>
+          <CardContent className="w-full">
+            <div style={{ height: '600px', width: '100%' }} className="w-full">
+              <MapContainer
+                center={[18.5204, 73.8567]}
+                zoom={12}
+                style={{ height: '100%', width: '100%' }}
+                className="w-full"
+              >
+                <TileLayer
+                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                  attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                />
+                {filteredReports.map((pothole) => {
+                  let markerColor = 'red';
+                  if (pothole.drone_status === 'in_progress' || pothole.status === 'In Progress') {
+                    markerColor = 'yellow';
+                  } else if (pothole.status === 'Resolved' || pothole.status === 'Inspected') {
+                    markerColor = 'green';
+                  }
+                  return (
+                    <CircleMarker
+                      key={pothole.id}
+                      center={[pothole.coordinates.lat, pothole.coordinates.lng]}
+                      radius={12}
+                      color={markerColor}
+                      fillOpacity={0.7}
+                    >
+                      <Popup>
+                        <div className="text-sm">
+                          <p className="font-semibold">{pothole.location}</p>
+                          <p>Severity: {pothole.severity}</p>
+                          <p>Estimated Cost: ₹{pothole.estimated_cost_inr}</p>
+                          <Button
+                            size="sm"
+                            className="bg-blue-600 hover:bg-blue-700 mt-2"
+                            onClick={() => handleAssignDrone(pothole.id)}
+                            disabled={loading || pothole.status !== 'Pending'}
+                          >
+                            Assign Drone
+                          </Button>
+                        </div>
+                      </Popup>
+                    </CircleMarker>
+                  );
+                })}
+              </MapContainer>
+            </div>
+            <div className="flex gap-4 mt-3 text-sm text-gray-600 justify-center w-full">
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-3 bg-red-500 rounded-full"></span> Pending
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-3 bg-yellow-400 rounded-full"></span> In Progress
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-3 bg-green-500 rounded-full"></span> Resolved
+              </span>
+            </div>
+          </CardContent>
+        </Card>
         {/* Filters */}
         <Card className="mb-6">
           <CardHeader>
@@ -192,48 +278,59 @@ const AuthorityDashboard = ({ user, onLogout }) => {
               {filteredReports.length === 0 ? (
                 <p className="text-center text-gray-500 py-8">No reports found</p>
               ) : (
-                filteredReports.map((report) => (
-                  <div
-                    key={report.id}
-                    className="border rounded-lg p-4 hover:bg-gray-50 transition-colors cursor-pointer"
-                    onClick={() => {
-                      setSelectedReport(report);
-                      setIsDialogOpen(true);
-                    }}
-                    data-testid={`authority-report-${report.id}`}
-                  >
-                    <div className="flex justify-between items-start mb-3">
-                      <div className="flex-1">
-                        <h3 className="font-semibold text-lg">{report.location}</h3>
-                        <p className="text-sm text-gray-500">
-                          Reported: {new Date(report.created_at).toLocaleString()}
-                        </p>
+                filteredReports
+                  .filter(report => {
+                    // If filterStatus is 'all', show all
+                    if (filterStatus === 'all') return true;
+                    // If filterStatus is 'In Progress', show both 'In Progress' and drone-assigned
+                    if (filterStatus === 'In Progress') {
+                      return report.status === 'In Progress' || report.drone_status === 'in_progress';
+                    }
+                    // Otherwise, match status
+                    return report.status === filterStatus;
+                  })
+                  .map((report) => (
+                    <div
+                      key={report.id}
+                      className="border rounded-lg p-4 hover:bg-gray-50 transition-colors cursor-pointer"
+                      onClick={() => {
+                        setSelectedReport(report);
+                        setIsDialogOpen(true);
+                      }}
+                      data-testid={`authority-report-${report.id}`}
+                    >
+                      <div className="flex justify-between items-start mb-3">
+                        <div className="flex-1">
+                          <h3 className="font-semibold text-lg">{report.location}</h3>
+                          <p className="text-sm text-gray-500">
+                            Reported: {new Date(report.created_at).toLocaleString()}
+                          </p>
+                        </div>
+                        <div className="flex gap-2">
+                          {getSeverityBadge(report.severity)}
+                          {getStatusBadge(report.status)}
+                        </div>
                       </div>
-                      <div className="flex gap-2">
-                        {getSeverityBadge(report.severity)}
-                        {getStatusBadge(report.status)}
+                      <div className="grid grid-cols-4 gap-4 text-sm">
+                        <div>
+                          <p className="text-gray-500">Potholes</p>
+                          <p className="font-semibold">{report.pothole_count}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500">Area</p>
+                          <p className="font-semibold">{report.total_area_m2} m²</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500">Material</p>
+                          <p className="font-semibold">{report.bags_required} bags</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500">Cost</p>
+                          <p className="font-semibold text-blue-600">₹{report.estimated_cost_inr}</p>
+                        </div>
                       </div>
                     </div>
-                    <div className="grid grid-cols-4 gap-4 text-sm">
-                      <div>
-                        <p className="text-gray-500">Potholes</p>
-                        <p className="font-semibold">{report.pothole_count}</p>
-                      </div>
-                      <div>
-                        <p className="text-gray-500">Area</p>
-                        <p className="font-semibold">{report.total_area_m2} m²</p>
-                      </div>
-                      <div>
-                        <p className="text-gray-500">Material</p>
-                        <p className="font-semibold">{report.bags_required} bags</p>
-                      </div>
-                      <div>
-                        <p className="text-gray-500">Cost</p>
-                        <p className="font-semibold text-blue-600">₹{report.estimated_cost_inr}</p>
-                      </div>
-                    </div>
-                  </div>
-                ))
+                  ))
               )}
             </div>
           </CardContent>

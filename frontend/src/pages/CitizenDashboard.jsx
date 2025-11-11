@@ -28,6 +28,8 @@ const CitizenDashboard = ({ user, onLogout }) => {
   const [analysisResult, setAnalysisResult] = useState(null);
   const [reports, setReports] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [distance, setDistance] = useState("1.0");
+
 
   useEffect(() => {
     loadReports();
@@ -89,7 +91,7 @@ const CitizenDashboard = ({ user, onLogout }) => {
 
     setIsAnalyzing(true);
     try {
-      const result = await api.analyzePothole(selectedFile, location, coordinates);
+      const result = await api.analyzePothole(selectedFile, location, coordinates, parseFloat(distance));
       setAnalysisResult(result);
       toast.success('Analysis complete!');
       loadReports();
@@ -211,6 +213,20 @@ const CitizenDashboard = ({ user, onLogout }) => {
                       <MapPin className="w-4 h-4" />
                     </Button>
                   </div>
+                </div>
+                {/* Distance Selector */}
+                <div>
+                  <Label>Photo Distance</Label>
+                  <select
+                    value={distance}
+                    onChange={(e) => setDistance(e.target.value)}
+                    className="w-full mt-2 border rounded-md p-2 text-gray-700"
+                  >
+                    <option value="0.5">Close (≈1 m)</option>
+                    <option value="1.0">Medium (≈2–3 m)</option>
+                    <option value="2.0">Far (≈5–6 m)</option>
+                  </select>
+                  <p className="text-xs text-gray-500 mt-1">Select how close the photo was taken</p>
                 </div>
 
                 <Button
