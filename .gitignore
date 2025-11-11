@@ -51,6 +51,9 @@ __pycache__/
 *pyc*
 venv/
 .venv/
+# Ignore Python virtual environments
+venv/
+backend/venv311/
 
 # Development tools
 chainlit.md
